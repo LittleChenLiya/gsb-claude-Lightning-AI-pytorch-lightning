@@ -28,6 +28,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Changed `ModelCheckpoint` to save checkpoints atomically on the local filesystem: the checkpoint is written to a temporary file first and then moved into place, so a failed or interrupted save no longer corrupts the last valid checkpoint and incomplete temporary files are cleaned up ([#21882](https://github.com/Lightning-AI/pytorch-lightning/pull/21882))
+
 - Changed the `dirpath` argument of `lightning.pytorch.profilers` profilers to accept `str | os.PathLike[str]` instead of `str | pathlib.Path` ([#21871](https://github.com/Lightning-AI/pytorch-lightning/pull/21871))
 
 ### Removed

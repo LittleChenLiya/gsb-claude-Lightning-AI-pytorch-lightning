@@ -252,6 +252,11 @@ class ModelCheckpoint(Checkpoint):
 
         Read more: :ref:`Persisting Callback State <extensions/callbacks_state:save callback state>`
 
+    .. note::
+        On the local filesystem, checkpoints are saved atomically: the checkpoint is written to a temporary file
+        first and then moved into place, so an interrupted or failed save never corrupts the last valid checkpoint
+        and no incomplete temporary files are left behind.
+
     """
 
     CHECKPOINT_JOIN_CHAR = "-"
@@ -597,7 +602,10 @@ class ModelCheckpoint(Checkpoint):
         the optimizer step, so we can use that state directly.
 
         """
-        trainer.save_checkpoint(filepath, self.save_weights_only)
+        if self._should_save_atomically(trainer, filepath):
+            self._save_checkpoint_atomically(trainer, filepath)
+        else:
+            trainer.save_checkpoint(filepath, self.save_weights_only)
         self._last_global_step_saved = trainer.global_step
         self._last_checkpoint_saved = filepath
 
@@ -605,6 +613,62 @@ class ModelCheckpoint(Checkpoint):
         if trainer.is_global_zero:
             for logger in trainer.loggers:
                 logger.after_save_checkpoint(proxy(self))
+
+    @staticmethod
+    def _should_save_atomically(trainer: "pl.Trainer", filepath: str) -> bool:
+        # Atomic replacement through a temporary file is only possible on the local filesystem. Checkpoints to
+        # remote/object storage are already saved transactionally by ``TorchCheckpointIO``.
+        if not _is_local_file_protocol(filepath):
+            return False
+        # ``AsyncCheckpointIO`` returns before the checkpoint has been written to disk, so the temporary file
+        # cannot be moved into place synchronously
+        from lightning.pytorch.plugins.io.async_plugin import AsyncCheckpointIO
+
+        return not isinstance(trainer.strategy.checkpoint_io, AsyncCheckpointIO)
+
+    def _save_checkpoint_atomically(self, trainer: "pl.Trainer", filepath: str) -> None:
+        """Save the checkpoint by writing it to a temporary file first and then atomically replacing ``filepath``
+        with it.
+
+        If writing the temporary file fails, the previous checkpoint at ``filepath`` (if any) is left untouched
+        and the incomplete temporary file is removed.
+
+        """
+        tmp_filepath = str(filepath) + ".tmp"
+        try:
+            trainer.save_checkpoint(tmp_filepath, self.save_weights_only)
+        except BaseException:
+            # The write failed: recycle the incomplete temporary file. The last valid checkpoint is preserved,
+            # because ``filepath`` only gets replaced after the temporary file was written successfully.
+            try:
+                self._remove_checkpoint(trainer, tmp_filepath)
+            except Exception as cleanup_error:
+                rank_zero_warn(
+                    f"Could not remove the incomplete temporary checkpoint {tmp_filepath!r}: {cleanup_error}"
+                )
+            raise
+        if trainer.is_global_zero and os.path.lexists(tmp_filepath):
+            # the existence check guards against ``trainer.save_checkpoint`` being intercepted (e.g. mocked in
+            # tests) without producing the temporary file
+            self._replace_checkpoint(tmp_filepath, filepath)
+        trainer.strategy.barrier()
+
+    @staticmethod
+    def _replace_checkpoint(tmp_filepath: str, filepath: str) -> None:
+        if not os.path.isdir(tmp_filepath):
+            # atomic on the same filesystem, both on POSIX and Windows
+            os.replace(tmp_filepath, filepath)
+            return
+        # Directory checkpoints (for example sharded distributed checkpoints) cannot be swapped atomically.
+        # Rotate the previous checkpoint aside so that a valid copy exists until the new one is in place.
+        backup_filepath = filepath + ".old"
+        if os.path.lexists(filepath):
+            os.replace(filepath, backup_filepath)
+        os.replace(tmp_filepath, filepath)
+        if os.path.isdir(backup_filepath):
+            shutil.rmtree(backup_filepath)
+        elif os.path.lexists(backup_filepath):
+            os.remove(backup_filepath)
 
     @staticmethod
     def _link_checkpoint(trainer: "pl.Trainer", filepath: str, linkpath: str) -> None:

@@ -1319,10 +1319,11 @@ def test_default_checkpoint_behavior(tmp_path):
     assert len(results) == 1
     save_dir = tmp_path / "checkpoints"
     save_weights_only = trainer.checkpoint_callback.save_weights_only
+    # checkpoints get written to a temporary file first and then atomically moved into place
     save_mock.assert_has_calls([
-        call(str(save_dir / "epoch=0-step=5.ckpt"), save_weights_only),
-        call(str(save_dir / "epoch=1-step=10.ckpt"), save_weights_only),
-        call(str(save_dir / "epoch=2-step=15.ckpt"), save_weights_only),
+        call(str(save_dir / "epoch=0-step=5.ckpt") + ".tmp", save_weights_only),
+        call(str(save_dir / "epoch=1-step=10.ckpt") + ".tmp", save_weights_only),
+        call(str(save_dir / "epoch=2-step=15.ckpt") + ".tmp", save_weights_only),
     ])
     ckpts = os.listdir(save_dir)
     assert len(ckpts) == 1
@@ -2180,3 +2181,128 @@ def test_save_last_only_when_checkpoint_saved(tmp_path):
     assert len(checkpoint_files) == expected_files, (
         f"Expected {expected_files} files, got {len(checkpoint_files)}: {checkpoint_names}"
     )
+
+
+def _fit_one_epoch(tmp_path, checkpoint_callback):
+    """Fit a BoringModel for one epoch with the given checkpoint callback."""
+    model = BoringModel()
+    trainer = Trainer(
+        default_root_dir=tmp_path,
+        callbacks=[checkpoint_callback],
+        max_epochs=1,
+        limit_train_batches=2,
+        limit_val_batches=0,
+        logger=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        num_sanity_val_steps=0,
+    )
+    trainer.fit(model)
+    return trainer
+
+
+def test_model_checkpoint_atomic_save_leaves_no_tmp_files(tmp_path):
+    """Test that on the happy path, checkpoints are written through a temporary file that gets moved into place,
+    leaving no temporary files behind."""
+    checkpoint_callback = ModelCheckpoint(dirpath=tmp_path, save_top_k=-1, save_last=True)
+    _fit_one_epoch(tmp_path, checkpoint_callback)
+
+    saved_files = os.listdir(tmp_path)
+    assert "last.ckpt" in saved_files
+    assert any(name.startswith("epoch=") and name.endswith(".ckpt") for name in saved_files)
+    assert not any(name.endswith((".tmp", ".old")) for name in saved_files)
+
+    # the saved checkpoints are valid and loadable
+    checkpoint = torch.load(tmp_path / "last.ckpt", map_location="cpu", weights_only=False)
+    assert "epoch" in checkpoint
+    assert checkpoint["state_dict"]
+
+
+def test_model_checkpoint_atomic_save_failure_preserves_previous_checkpoint(tmp_path, monkeypatch):
+    """Test that a failure halfway through writing the checkpoint to disk (fault injection in ``torch.save``)
+    neither corrupts the previously saved checkpoint nor leaves temporary files behind, and that checkpointing
+    recovers once the failure is gone."""
+    checkpoint_callback = ModelCheckpoint(dirpath=tmp_path, save_top_k=0, save_last=True)
+    _fit_one_epoch(tmp_path, checkpoint_callback)
+
+    filepath = tmp_path / "last.ckpt"
+    assert filepath.is_file()
+    contents_before = filepath.read_bytes()
+
+    def faulty_save(*args, **kwargs):
+        # simulate the disk failing halfway through the checkpoint write
+        file = args[1] if len(args) > 1 else kwargs["f"]
+        file.write(b"partial-checkpoint-bytes")
+        file.flush()
+        raise RuntimeError("Simulated I/O failure while writing the checkpoint")
+
+    monkeypatch.setattr(torch, "save", faulty_save)
+    with pytest.raises(RuntimeError, match="Simulated I/O failure while writing the checkpoint"):
+        _fit_one_epoch(tmp_path, ModelCheckpoint(dirpath=tmp_path, save_top_k=0, save_last=True))
+    monkeypatch.undo()
+
+    # the previous valid checkpoint was not overwritten and no temporary files were left behind
+    assert filepath.read_bytes() == contents_before
+    assert torch.load(filepath, map_location="cpu", weights_only=False)["epoch"] == 1
+    assert not any(name.endswith((".tmp", ".old")) for name in os.listdir(tmp_path))
+
+    # recovery: checkpointing works again once the failure is gone, and the target file gets replaced in place
+    trainer = _fit_one_epoch(
+        tmp_path, ModelCheckpoint(dirpath=tmp_path, save_top_k=0, save_last=True, enable_version_counter=False)
+    )
+    checkpoint = torch.load(filepath, map_location="cpu", weights_only=False)
+    assert torch.equal(checkpoint["state_dict"]["layer.weight"], trainer.model.layer.weight)
+    assert not any(name.endswith((".tmp", ".old")) for name in os.listdir(tmp_path))
+
+
+def test_model_checkpoint_atomic_save_recycles_tmp_file_on_failure(tmp_path, monkeypatch):
+    """Test that when ``Trainer.save_checkpoint`` fails after a partial temporary file was created, the temporary
+    file is recycled and the previous checkpoint stays intact."""
+    checkpoint_callback = ModelCheckpoint(dirpath=tmp_path, save_top_k=0, save_last=True)
+    trainer = _fit_one_epoch(tmp_path, checkpoint_callback)
+
+    filepath = tmp_path / "last.ckpt"
+    assert filepath.is_file()
+    contents_before = filepath.read_bytes()
+    tmp_filepath = tmp_path / "last.ckpt.tmp"
+
+    def faulty_save_checkpoint(self, filepath, weights_only=None, storage_options=None):
+        # simulate a failure halfway through the write that leaves a partial temporary file behind
+        Path(filepath).write_bytes(b"partial-checkpoint-bytes")
+        raise RuntimeError("Simulated I/O failure while writing the checkpoint")
+
+    monkeypatch.setattr(Trainer, "save_checkpoint", faulty_save_checkpoint)
+    with pytest.raises(RuntimeError, match="Simulated I/O failure while writing the checkpoint"):
+        checkpoint_callback._save_checkpoint(trainer, str(filepath))
+    monkeypatch.undo()
+
+    # the incomplete temporary file was recycled and the previous checkpoint is untouched
+    assert not tmp_filepath.exists()
+    assert filepath.read_bytes() == contents_before
+
+    # recovery: saving works again after the failure is gone
+    checkpoint_callback._save_checkpoint(trainer, str(filepath))
+    assert not tmp_filepath.exists()
+    assert torch.load(filepath, map_location="cpu", weights_only=False)["state_dict"]
+
+
+def test_model_checkpoint_replace_checkpoint_with_directory(tmp_path):
+    """Test that ``_replace_checkpoint`` handles directory checkpoints (e.g. sharded distributed checkpoints) by
+    rotating the previous directory aside."""
+    filepath = tmp_path / "checkpoint.ckpt"
+    tmp_filepath = tmp_path / "checkpoint.ckpt.tmp"
+
+    # first save: no previous checkpoint exists
+    tmp_filepath.mkdir()
+    (tmp_filepath / "shard.pt").write_text("v1")
+    ModelCheckpoint._replace_checkpoint(str(tmp_filepath), str(filepath))
+    assert (filepath / "shard.pt").read_text() == "v1"
+    assert not tmp_filepath.exists()
+
+    # second save: the previous directory gets replaced and no backup is left behind
+    tmp_filepath.mkdir()
+    (tmp_filepath / "shard.pt").write_text("v2")
+    ModelCheckpoint._replace_checkpoint(str(tmp_filepath), str(filepath))
+    assert (filepath / "shard.pt").read_text() == "v2"
+    assert not tmp_filepath.exists()
+    assert not (tmp_path / "checkpoint.ckpt.old").exists()
