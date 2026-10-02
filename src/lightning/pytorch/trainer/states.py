@@ -71,6 +71,19 @@ class RunningStage(LightningEnum):
         return self.value
 
 
+class TrainerStopReason(LightningEnum):
+    """Enum for the reason why :meth:`~lightning.pytorch.trainer.trainer.Trainer.fit` stopped.
+
+    The reason is recorded once per fit run — the first condition that actually causes the training loop to
+    exit wins. Calling :meth:`~lightning.pytorch.trainer.trainer.Trainer.fit` again resets it.
+
+    """
+
+    MAX_STEPS = "max_steps"
+    MAX_EPOCHS = "max_epochs"
+    CALLBACK = "callback"
+
+
 @dataclass
 class TrainerState:
     """Dataclass to encapsulate the current :class:`~lightning.pytorch.trainer.trainer.Trainer` state."""
@@ -78,6 +91,7 @@ class TrainerState:
     status: TrainerStatus = TrainerStatus.INITIALIZING
     fn: Optional[TrainerFn] = None
     stage: Optional[RunningStage] = None
+    stop_reason: Optional[TrainerStopReason] = None
 
     @property
     def finished(self) -> bool:

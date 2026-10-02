@@ -65,7 +65,13 @@ from lightning.pytorch.trainer.connectors.data_connector import _DataConnector
 from lightning.pytorch.trainer.connectors.logger_connector import _LoggerConnector
 from lightning.pytorch.trainer.connectors.logger_connector.result import _OUT_DICT, _PBAR_DICT, _ResultCollection
 from lightning.pytorch.trainer.connectors.signal_connector import _SignalConnector
-from lightning.pytorch.trainer.states import RunningStage, TrainerFn, TrainerState, TrainerStatus
+from lightning.pytorch.trainer.states import (
+    RunningStage,
+    TrainerFn,
+    TrainerState,
+    TrainerStatus,
+    TrainerStopReason,
+)
 from lightning.pytorch.utilities import GradClipAlgorithmType, parsing
 from lightning.pytorch.utilities.argparse import _defaults_from_env_vars
 from lightning.pytorch.utilities.compile import _maybe_unwrap_optimized, _verify_strategy_supports_compile
@@ -592,6 +598,8 @@ class Trainer:
         self.state.status = TrainerStatus.RUNNING
         self.training = True
         self.should_stop = False
+        # a new fit run starts with no stop reason; the first effective stop condition will be recorded
+        self.state.stop_reason = None
         call._call_and_handle_interrupt(
             self,
             self._fit_impl,
@@ -1589,6 +1597,28 @@ class Trainer:
     @property
     def min_steps(self) -> Optional[int]:
         return self.fit_loop.min_steps
+
+    @property
+    def stop_reason(self) -> Optional[TrainerStopReason]:
+        """The reason why the last :meth:`~lightning.pytorch.trainer.trainer.Trainer.fit` run stopped.
+
+        Returns ``None`` while training is running or if it has not been recorded yet. Once training stops, it holds
+        one of :class:`~lightning.pytorch.trainer.states.TrainerStopReason` (``max_steps``, ``max_epochs`` or
+        ``callback``). Only the first condition that actually stops the run is recorded; calling ``fit`` again resets
+        it to ``None``.
+
+        """
+        return self.state.stop_reason
+
+    def _record_stop_reason(self, reason: TrainerStopReason) -> None:
+        """Records the stop reason for the current fit run.
+
+        The first effective reason wins: once set, subsequent stop conditions (e.g. a callback signaling stop after
+        ``max_steps`` was already reached) are ignored.
+
+        """
+        if self.state.stop_reason is None:
+            self.state.stop_reason = reason
 
     @property
     def is_last_batch(self) -> bool:

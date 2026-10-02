@@ -37,7 +37,7 @@ from lightning.pytorch.trainer.connectors.data_connector import (
     _resolve_overfit_batches,
 )
 from lightning.pytorch.trainer.connectors.logger_connector.result import _ResultCollection
-from lightning.pytorch.trainer.states import RunningStage, TrainerFn
+from lightning.pytorch.trainer.states import RunningStage, TrainerFn, TrainerStopReason
 from lightning.pytorch.utilities.combined_loader import _SUPPORTED_MODES, CombinedLoader
 from lightning.pytorch.utilities.data import has_len_all_ranks
 from lightning.pytorch.utilities.exceptions import MisconfigurationException, SIGTERMException
@@ -178,6 +178,7 @@ class _FitLoop(_Loop):
 
         stop_steps = _is_max_limit_reached(self.epoch_loop.global_step, self.max_steps)
         if stop_steps:
+            self.trainer._record_stop_reason(TrainerStopReason.MAX_STEPS)
             rank_zero_info(f"`Trainer.fit` stopped: `max_steps={self.max_steps!r}` reached.")
             return True
 
@@ -186,12 +187,14 @@ class _FitLoop(_Loop):
         assert isinstance(self.max_epochs, int)
         stop_epochs = _is_max_limit_reached(self.epoch_progress.current.processed, self.max_epochs)
         if stop_epochs:
+            self.trainer._record_stop_reason(TrainerStopReason.MAX_EPOCHS)
             # in case they are not equal, override so `trainer.current_epoch` has the expected value
             self.epoch_progress.current.completed = self.epoch_progress.current.processed
             rank_zero_info(f"`Trainer.fit` stopped: `max_epochs={self.max_epochs!r}` reached.")
             return True
 
         if self.trainer.should_stop and self._can_stop_early:
+            self.trainer._record_stop_reason(TrainerStopReason.CALLBACK)
             rank_zero_debug("`Trainer.fit` stopped: `trainer.should_stop` was set.")
             return True
 
