@@ -1319,11 +1319,14 @@ def test_default_checkpoint_behavior(tmp_path):
     assert len(results) == 1
     save_dir = tmp_path / "checkpoints"
     save_weights_only = trainer.checkpoint_callback.save_weights_only
-    save_mock.assert_has_calls([
-        call(str(save_dir / "epoch=0-step=5.ckpt"), save_weights_only),
-        call(str(save_dir / "epoch=1-step=10.ckpt"), save_weights_only),
-        call(str(save_dir / "epoch=2-step=15.ckpt"), save_weights_only),
-    ])
+    # checkpoints are written to a temp file first and atomically replaced, so ``save_checkpoint`` is called with a
+    # temporary path in the same directory rather than the final checkpoint path
+    assert save_mock.call_count == 3
+    for c in save_mock.call_args_list:
+        args, _ = c
+        assert args[1] == save_weights_only
+        assert os.path.dirname(args[0]) == str(save_dir)
+        assert ".tmp" in os.path.basename(args[0])
     ckpts = os.listdir(save_dir)
     assert len(ckpts) == 1
     assert ckpts[0] == "epoch=2-step=15.ckpt"

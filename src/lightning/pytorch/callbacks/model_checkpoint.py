@@ -18,10 +18,12 @@ Model Checkpointing
 Automatically save model checkpoints during training.
 """
 
+import contextlib
 import logging
 import os
 import re
 import shutil
+import tempfile
 import time
 import warnings
 from copy import deepcopy
@@ -45,6 +47,13 @@ from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 log = logging.getLogger(__name__)
 warning_cache = WarningCache()
+
+
+def _get_umask() -> int:
+    """Return the current process umask without changing it."""
+    current_umask = os.umask(0o777)
+    os.umask(current_umask)
+    return current_umask
 
 
 class ModelCheckpoint(Checkpoint):
@@ -597,7 +606,12 @@ class ModelCheckpoint(Checkpoint):
         the optimizer step, so we can use that state directly.
 
         """
-        trainer.save_checkpoint(filepath, self.save_weights_only)
+        if _is_local_file_protocol(filepath):
+            self._atomic_save_checkpoint(trainer, filepath)
+        else:
+            # Remote filesystems (e.g. s3://) cannot be renamed atomically with ``os.replace``; the checkpoint IO
+            # handles the write itself (see ``_atomic_save`` in ``lightning.fabric.utilities.cloud_io``).
+            trainer.save_checkpoint(filepath, self.save_weights_only)
         self._last_global_step_saved = trainer.global_step
         self._last_checkpoint_saved = filepath
 
@@ -606,19 +620,68 @@ class ModelCheckpoint(Checkpoint):
             for logger in trainer.loggers:
                 logger.after_save_checkpoint(proxy(self))
 
+    def _atomic_save_checkpoint(self, trainer: "pl.Trainer", filepath: str) -> None:
+        """Save the checkpoint to a temporary file first and atomically replace ``filepath`` on success.
+
+        Writing to a temp file in the same directory guarantees that a failed write (disk full, interrupted training,
+        injected filesystem fault, ...) never leaves a half-written checkpoint at ``filepath``: the previous valid
+        checkpoint stays intact and the temp file is recycled. The rename is atomic on local filesystems.
+
+        """
+        tmp_filepath: Optional[str] = None
+        if trainer.is_global_zero:
+            dirpath = os.path.dirname(os.path.abspath(filepath))
+            os.makedirs(dirpath, exist_ok=True)
+            fd, tmp_filepath = tempfile.mkstemp(
+                prefix=f".{os.path.basename(filepath)}.", suffix=".tmp", dir=dirpath
+            )
+            os.close(fd)
+        try:
+            # All ranks must call ``save_checkpoint`` (state dump can be a collective); only rank 0 writes the file.
+            trainer.save_checkpoint(tmp_filepath or filepath, self.save_weights_only)
+            if trainer.is_global_zero:
+                # ``mkstemp`` creates files with 0600; match the permissions a direct write would produce.
+                with contextlib.suppress(OSError):
+                    os.chmod(tmp_filepath, 0o666 & ~_get_umask())
+                os.replace(tmp_filepath, filepath)
+        except BaseException:
+            # Recycle the temporary file so no partial checkpoint is left behind.
+            if trainer.is_global_zero and tmp_filepath is not None:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_filepath)
+            raise
+
     @staticmethod
     def _link_checkpoint(trainer: "pl.Trainer", filepath: str, linkpath: str) -> None:
         if trainer.is_global_zero and os.path.abspath(filepath) != os.path.abspath(linkpath):
-            if os.path.islink(linkpath) or os.path.isfile(linkpath):
-                os.remove(linkpath)
-            elif os.path.isdir(linkpath):
+            # Create the link at a temporary name and atomically replace so a failed link creation never leaves a
+            # half-written link behind.
+            link_dir = os.path.dirname(os.path.abspath(linkpath))
+            os.makedirs(link_dir, exist_ok=True)
+
+            # ``os.replace`` can atomically replace files and symlinks, but not directories.
+            if os.path.isdir(linkpath) and not os.path.islink(linkpath):
                 shutil.rmtree(linkpath)
+
+            fd, tmp_linkpath = tempfile.mkstemp(
+                prefix=f".{os.path.basename(linkpath)}.", suffix=".tmp", dir=link_dir
+            )
+            os.close(fd)
+            # ``symlink`` requires a non-existing target path.
+            os.remove(tmp_linkpath)
             try:
-                os.symlink(os.path.relpath(filepath, os.path.dirname(linkpath)), linkpath)
-            except OSError:
-                # on Windows, special permissions are required to create symbolic links as a regular user
-                # fall back to copying the file
-                shutil.copy(filepath, linkpath)
+                try:
+                    os.symlink(os.path.relpath(filepath, os.path.dirname(linkpath)), tmp_linkpath)
+                except OSError:
+                    # on Windows, special permissions are required to create symbolic links as a regular user
+                    # fall back to copying the file
+                    shutil.copy(filepath, tmp_linkpath)
+                os.replace(tmp_linkpath, linkpath)
+            except BaseException:
+                # Recycle the temporary link/file so no partial state is left behind.
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_linkpath)
+                raise
         trainer.strategy.barrier()
 
     def _should_skip_saving_checkpoint(self, trainer: "pl.Trainer") -> bool:
