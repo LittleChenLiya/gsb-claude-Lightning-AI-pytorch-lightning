@@ -499,6 +499,7 @@ class Trainer:
         setup._log_device_info(self)
 
         self.should_stop = False
+        self._stop_reason: Optional[str] = None
         self.state = TrainerState()
 
         # configure profiler
@@ -592,6 +593,8 @@ class Trainer:
         self.state.status = TrainerStatus.RUNNING
         self.training = True
         self.should_stop = False
+        # reset the stop reason so that a previous ``fit`` call does not leak into this one
+        self._stop_reason = None
         call._call_and_handle_interrupt(
             self,
             self._fit_impl,
@@ -1105,6 +1108,10 @@ class Trainer:
         self.state.status = TrainerStatus.FINISHED
         self.state.stage = None
 
+        if self.state.fn == TrainerFn.FITTING:
+            reason = self._stop_reason if self._stop_reason is not None else "unknown"
+            rank_zero_info(f"`Trainer.fit` stopped: stop_reason={reason!r}")
+
         return results
 
     def _teardown(self) -> None:
@@ -1585,6 +1592,26 @@ class Trainer:
     @property
     def max_steps(self) -> int:
         return self.fit_loop.max_steps
+
+    @property
+    def stop_reason(self) -> Optional[str]:
+        """The reason why training stopped, or ``None`` if training has not stopped yet.
+
+        Only the first stop condition that takes effect during a call to :meth:`fit` gets recorded. Possible values:
+
+        - ``"max_steps"``: the ``max_steps`` limit was reached
+        - ``"max_epochs"``: the ``max_epochs`` limit was reached
+        - ``"callback"``: a callback or hook requested the stop by setting ``trainer.should_stop = True``
+
+        The reason is reset to ``None`` at the beginning of every :meth:`fit` call.
+        """
+        return self._stop_reason
+
+    def _set_stop_reason(self, reason: str) -> None:
+        """Record why training is stopping. Only the first reason set during a ``fit`` call is kept; subsequent
+        calls are no-ops so the effective cause is preserved."""
+        if self._stop_reason is None:
+            self._stop_reason = reason
 
     @property
     def min_steps(self) -> Optional[int]:

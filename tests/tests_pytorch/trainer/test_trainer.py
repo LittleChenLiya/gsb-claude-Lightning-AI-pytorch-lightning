@@ -620,6 +620,51 @@ def test_trainer_min_steps_and_min_epochs_not_reached(tmp_path, caplog):
     assert model.training_step_invoked == min_epochs * 2
 
 
+def test_trainer_stop_reason_report(tmp_path):
+    """Test that the trainer records a stable stop reason, keeps only the first effective reason, and resets it on
+    the next ``fit`` call."""
+
+    class StopOnEpoch1(Callback):
+        def on_train_epoch_end(self, trainer, pl_module):
+            if trainer.current_epoch == 1:
+                trainer.should_stop = True
+
+    trainer_kwargs = {
+        "default_root_dir": tmp_path,
+        "logger": False,
+        "enable_checkpointing": False,
+        "enable_progress_bar": False,
+        "enable_model_summary": False,
+    }
+
+    # max_steps stop
+    trainer = Trainer(max_steps=3, max_epochs=-1, **trainer_kwargs)
+    assert trainer.stop_reason is None
+    trainer.fit(BoringModel())
+    assert trainer.stop_reason == "max_steps"
+
+    # max_epochs stop
+    trainer = Trainer(max_epochs=2, **trainer_kwargs)
+    trainer.fit(BoringModel())
+    assert trainer.stop_reason == "max_epochs"
+
+    # callback stop through `trainer.should_stop`
+    trainer = Trainer(max_epochs=10, callbacks=[StopOnEpoch1()], **trainer_kwargs)
+    trainer.fit(BoringModel())
+    assert trainer.stop_reason == "callback"
+
+    # a second `fit` call resets the previous reason
+    trainer.callbacks.clear()
+    trainer.fit_loop.max_epochs = 3
+    trainer.fit(BoringModel())
+    assert trainer.stop_reason == "max_epochs"
+
+    # only the first effective reason is recorded
+    trainer = Trainer(max_steps=2, max_epochs=-1, callbacks=[StopOnEpoch1()], **trainer_kwargs)
+    trainer.fit(BoringModel())
+    assert trainer.stop_reason == "max_steps"
+
+
 def test_trainer_max_steps_accumulate_batches(tmp_path):
     """Verify model trains according to specified max steps with grad accumulated batches."""
     model = BoringModel()

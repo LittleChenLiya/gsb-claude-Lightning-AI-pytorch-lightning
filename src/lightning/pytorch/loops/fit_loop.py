@@ -178,6 +178,7 @@ class _FitLoop(_Loop):
 
         stop_steps = _is_max_limit_reached(self.epoch_loop.global_step, self.max_steps)
         if stop_steps:
+            self.trainer._set_stop_reason("max_steps")
             rank_zero_info(f"`Trainer.fit` stopped: `max_steps={self.max_steps!r}` reached.")
             return True
 
@@ -188,10 +189,12 @@ class _FitLoop(_Loop):
         if stop_epochs:
             # in case they are not equal, override so `trainer.current_epoch` has the expected value
             self.epoch_progress.current.completed = self.epoch_progress.current.processed
+            self.trainer._set_stop_reason("max_epochs")
             rank_zero_info(f"`Trainer.fit` stopped: `max_epochs={self.max_epochs!r}` reached.")
             return True
 
         if self.trainer.should_stop and self._can_stop_early:
+            self.trainer._set_stop_reason("callback")
             rank_zero_debug("`Trainer.fit` stopped: `trainer.should_stop` was set.")
             return True
 
