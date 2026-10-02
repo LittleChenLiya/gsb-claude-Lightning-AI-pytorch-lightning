@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from contextlib import AbstractContextManager, nullcontext
-from datetime import timedelta
+import logging
+from contextlib import AbstractContextManager, nullcontext, suppress
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional, Union
 
 import torch
@@ -41,12 +42,16 @@ from lightning.fabric.utilities.distributed import (
     _sync_ddp_if_available,
 )
 from lightning.fabric.utilities.distributed import group as _group
-from lightning.fabric.utilities.rank_zero import rank_zero_only
+from lightning.fabric.utilities.rank_zero import rank_zero_info, rank_zero_only
+
+log = logging.getLogger(__name__)
 
 _DDP_FORK_ALIASES = (
     "ddp_fork",
     "ddp_notebook",
 )
+
+_DEFAULT_EXIT_REPORT_TIMEOUT = timedelta(seconds=30)
 
 
 class DDPStrategy(ParallelStrategy):
@@ -61,6 +66,7 @@ class DDPStrategy(ParallelStrategy):
         precision: Optional[Precision] = None,
         process_group_backend: Optional[str] = None,
         timeout: Optional[timedelta] = default_pg_timeout,
+        exit_report_timeout: Optional[timedelta] = _DEFAULT_EXIT_REPORT_TIMEOUT,
         start_method: Literal["popen", "spawn", "fork", "forkserver"] = "popen",
         **kwargs: Any,
     ) -> None:
@@ -74,9 +80,13 @@ class DDPStrategy(ParallelStrategy):
         self._num_nodes = 1
         self._process_group_backend: Optional[str] = process_group_backend
         self._timeout: Optional[timedelta] = timeout
+        self._exit_report_timeout: Optional[timedelta] = exit_report_timeout
         self._start_method = start_method
         self._backward_sync_control = _DDPBackwardSyncControl()
         self._ddp_kwargs = kwargs
+        self._exit_status: dict[str, Any] = {"status": "ok", "converged": True}
+        self._exit_report: Optional[list[dict[str, Any]]] = None
+        self._teardown_complete = False
 
     @property
     @override
@@ -205,6 +215,97 @@ class DDPStrategy(ParallelStrategy):
         if isinstance(module, DistributedDataParallel):
             module = module.module
         super().load_module_state_dict(module=module, state_dict=state_dict, strict=strict)
+
+    @property
+    def exit_report(self) -> Optional[list[dict[str, Any]]]:
+        """The DDP exit report collected during :meth:`teardown`, with one entry per reporting rank.
+
+        Returns ``None`` if teardown has not run yet.
+
+        """
+        return self._exit_report
+
+    def set_exit_status(self, status: str = "ok", converged: bool = True, **extra: Any) -> None:
+        """Record this rank's exit/convergence status, which gets included in the DDP exit report emitted at
+        teardown.
+
+        Args:
+            status: A short string describing how this rank finished, e.g. ``"ok"`` or ``"failed"``.
+            converged: Whether this rank considers its training converged.
+            extra: Additional JSON-serializable key-value pairs to include in this rank's report entry.
+
+        """
+        self._exit_status = {"status": status, "converged": converged, **extra}
+
+    @override
+    def teardown(self) -> None:
+        # Teardown is idempotent: repeated calls (e.g. from both Fabric and a launcher) must not re-run
+        # collectives or cleanup
+        if self._teardown_complete:
+            return
+        self._teardown_complete = True
+        self._exit_report = self._collect_exit_report()
+        self._log_exit_report(self._exit_report)
+        super().teardown()
+
+    def _local_exit_report_entry(self) -> dict[str, Any]:
+        return {
+            "rank": self.global_rank,
+            "local_rank": self.local_rank,
+            "node_rank": self.node_rank,
+            "world_size": self.world_size,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **self._exit_status,
+        }
+
+    def _collect_exit_report(self) -> list[dict[str, Any]]:
+        """Gather the exit status of all ranks into a report.
+
+        The gather runs on a dedicated process group with a short timeout so that a rank that crashed or hangs
+        cannot block the remaining ranks indefinitely. If the gather fails or times out, a partial report
+        containing only the local rank's entry is returned.
+
+        """
+        entry = self._local_exit_report_entry()
+        if not _distributed_is_initialized() or torch.distributed.get_world_size() == 1:
+            return [entry]
+        world_size = torch.distributed.get_world_size()
+        gathered: list[Any] = [None] * world_size
+        report_group = None
+        try:
+            report_group = torch.distributed.new_group(timeout=self._exit_report_timeout or default_pg_timeout)
+            torch.distributed.all_gather_object(gathered, entry, group=report_group)
+        except Exception as ex:
+            log.warning(
+                f"DDP exit report is incomplete: could not gather the exit status of all {world_size} ranks"
+                f" within {self._exit_report_timeout}. Reporting the local rank only. Error: {ex}"
+            )
+            return [entry]
+        finally:
+            if report_group is not None:
+                with suppress(Exception):
+                    torch.distributed.destroy_process_group(report_group)
+        return [e for e in gathered if e is not None]
+
+    def _log_exit_report(self, report: list[dict[str, Any]]) -> None:
+        complete = len(report) == self.world_size
+        header = (
+            "DDP exit report:"
+            if complete
+            else f"DDP exit report (partial: {len(report)}/{self.world_size} ranks reported):"
+        )
+        lines = [header]
+        for entry in sorted(report, key=lambda e: e["rank"]):
+            lines.append(
+                f"  rank {entry['rank']}/{entry['world_size']} (node {entry['node_rank']},"
+                f" local rank {entry['local_rank']}): status={entry['status']!r}, converged={entry['converged']}"
+            )
+        message = "\n".join(lines)
+        if complete:
+            rank_zero_info(message)
+        else:
+            # on a partial report the surviving rank(s) may not include rank 0, so log locally
+            log.info(message)
 
     @classmethod
     @override

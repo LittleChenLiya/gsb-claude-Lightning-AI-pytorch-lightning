@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Added a DDP group exit report to `DDPStrategy.teardown`: ranks gather their exit/convergence status (recorded via `DDPStrategy.set_exit_status`) on a dedicated short-timeout process group (`exit_report_timeout`, default 30 s) so a crashed or hanging rank cannot block the others indefinitely, and teardown is idempotent ([#21888](https://github.com/Lightning-AI/pytorch-lightning/pull/21888))
+
 - Added `using_sparse_model` and `sparse_cuda_acceleration_factor` parameters to `Throughput` so MFU defaults to the dense peak and opts into the sparse peak explicitly ([#21743](https://github.com/Lightning-AI/pytorch-lightning/pull/21743))
 
 - Added support for remote storage (fsspec URLs) when saving and loading distributed checkpoints with `FSDPStrategy` ([#21775](https://github.com/Lightning-AI/pytorch-lightning/pull/21775))
