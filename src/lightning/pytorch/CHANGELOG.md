@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/).
 
 - Added support for remote storage (fsspec URLs) when saving and loading distributed checkpoints with `ModelParallelStrategy` ([#21797](https://github.com/Lightning-AI/pytorch-lightning/issues/21797))
 
+- Added skipped-step counters to the automatic optimization loop: `fit_loop.epoch_loop.automatic_optimization.optim_progress.skipped_optimizer_steps_invalid_gradient` counts step-boundary batches that did not call `optimizer.step` due to non-finite (NaN/Inf) gradients, and `..._accumulation` counts batches that only accumulated gradients because the accumulation window was not reached yet. `global_step` (the completed-step count) now only advances when an actual `optimizer.step` ran.
+
 ### Changed
 
 - Changed the `dirpath` argument of `lightning.pytorch.profilers` profilers to accept `str | os.PathLike[str]` instead of `str | pathlib.Path` ([#21871](https://github.com/Lightning-AI/pytorch-lightning/pull/21871))

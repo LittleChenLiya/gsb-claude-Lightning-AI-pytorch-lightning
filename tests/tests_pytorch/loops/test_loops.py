@@ -313,6 +313,15 @@ def test_loop_state_on_exception(accumulate_grad_batches, stop_epoch, stop_batch
     assert optim_progress.optimizer.zero_grad.total.completed == nbe_total_zero_grad + be_total_zero_grad
     assert optim_progress.optimizer.zero_grad.current.completed == be_total_zero_grad
 
+    # every batch that does not reach the accumulation window is counted as an accumulation skip; the `total`
+    # tracker persists across epochs while the `current` tracker resets at the start of each epoch
+    nbe_accumulation_skips = nbe_batches_completed - nbe_stepping_batches - has_leftover_accumulation_batches
+    be_accumulation_skips = be_batches_completed - be_stepping_batches
+    total_accumulation_skips = nbe_accumulation_skips + be_accumulation_skips
+    assert optim_progress.skipped_optimizer_steps_accumulation == total_accumulation_skips
+    assert optim_progress.optimizer.skipped.accumulation.current.completed == be_accumulation_skips
+    assert optim_progress.skipped_optimizer_steps_invalid_gradient == 0
+
     nbe_sch_steps = stop_epoch
     be_sch_steps = 0  # the current epoch did not complete
     assert sch_progress.total.completed == nbe_sch_steps + be_sch_steps
@@ -379,6 +388,16 @@ def test_loop_state_on_exception(accumulate_grad_batches, stop_epoch, stop_batch
                         "ready": be_total_zero_grad,
                         "started": be_total_zero_grad,
                         "completed": be_total_zero_grad,
+                    },
+                },
+                "skipped": {
+                    "invalid_gradient": {
+                        "total": {"ready": 0, "completed": 0},
+                        "current": {"ready": 0, "completed": 0},
+                    },
+                    "accumulation": {
+                        "total": {"ready": total_accumulation_skips, "completed": total_accumulation_skips},
+                        "current": {"ready": be_accumulation_skips, "completed": be_accumulation_skips},
                     },
                 },
             },
@@ -518,6 +537,16 @@ def test_loop_state_on_complete_run(tmp_path):
                         "ready": n_batches,
                         "started": n_batches,
                         "completed": n_batches,
+                    },
+                },
+                "skipped": {
+                    "invalid_gradient": {
+                        "total": {"ready": 0, "completed": 0},
+                        "current": {"ready": 0, "completed": 0},
+                    },
+                    "accumulation": {
+                        "total": {"ready": 0, "completed": 0},
+                        "current": {"ready": 0, "completed": 0},
                     },
                 },
             },

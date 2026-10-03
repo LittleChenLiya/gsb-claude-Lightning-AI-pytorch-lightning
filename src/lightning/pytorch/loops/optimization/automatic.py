@@ -159,6 +159,8 @@ class _AutomaticOptimization(_Loop):
         super().__init__(trainer)
         self.optim_progress: _OptimizationProgress = _OptimizationProgress()
         self._skip_backward: bool = False
+        # set to ``True`` by the injected LightningOptimizer hooks when an actual ``optimizer.step`` ran
+        self._optimizer_step_ran: bool = False
 
     def run(self, optimizer: Optimizer, batch_idx: int, kwargs: OrderedDict) -> _OUTPUTS_TYPE:
         """Runs closure (train step + backward) together with optimization if necessary.
@@ -183,6 +185,10 @@ class _AutomaticOptimization(_Loop):
             # automatic_optimization=True: perform ddp sync only when performing optimizer_step
             with _block_parallel_sync_behavior(self.trainer.strategy, block=True):
                 closure()
+
+            # the optimizer step was not attempted because the accumulation window has not been reached yet
+            self.optim_progress.optimizer.skipped.accumulation.increment_ready()
+            self.optim_progress.optimizer.skipped.accumulation.increment_completed()
 
         # ------------------------------
         # BACKWARD PASS
@@ -258,7 +264,7 @@ class _AutomaticOptimization(_Loop):
         trainer = self.trainer
 
         # wraps into LightningOptimizer only for running step
-        optimizer = trainer.strategy._lightning_optimizers[0]
+        lightning_optimizer = trainer.strategy._lightning_optimizers[0]
 
         # if `strategy.handles_gradient_accumulation`, this method will be called to route into the strategy, but we
         # need to check again if `should_accumulate` before increasing the counters
@@ -266,18 +272,56 @@ class _AutomaticOptimization(_Loop):
         if not should_accumulate:
             self.optim_progress.optimizer.step.increment_ready()
 
-        # model hook
-        call._call_lightning_module_hook(
-            trainer,
-            "optimizer_step",
-            trainer.current_epoch,
-            batch_idx,
-            optimizer,
-            train_step_and_backward_closure,
-        )
+        # inject logic around the actual optimizer step so that the completed counter (and thus `global_step`)
+        # only advances when an actual `optimizer.step` was performed
+        self._optimizer_step_ran = False
+        previous_on_before_step = lightning_optimizer._on_before_step
+        previous_on_after_step = lightning_optimizer._on_after_step
+        lightning_optimizer._on_before_step = self._on_before_optimizer_step
+        lightning_optimizer._on_after_step = self._on_after_optimizer_step
+        try:
+            # model hook
+            call._call_lightning_module_hook(
+                trainer,
+                "optimizer_step",
+                trainer.current_epoch,
+                batch_idx,
+                lightning_optimizer,
+                train_step_and_backward_closure,
+            )
+        finally:
+            lightning_optimizer._on_before_step = previous_on_before_step
+            lightning_optimizer._on_after_step = previous_on_after_step
 
-        if not should_accumulate:
+        if should_accumulate:
+            return
+
+        if self._optimizer_step_ran:
             self.optim_progress.optimizer.step.increment_completed()
+        elif self._gradients_are_non_finite(lightning_optimizer.optimizer):
+            # the accumulation window was reached, but no actual step ran because the gradients were invalid
+            self.optim_progress.optimizer.skipped.invalid_gradient.increment_ready()
+            self.optim_progress.optimizer.skipped.invalid_gradient.increment_completed()
+        # otherwise the accumulation window was reached but the user-defined `optimizer_step` hook decided
+        # not to perform a step with finite gradients: this is neither an invalid-gradient skip nor a
+        # completed step, so no counter advances (but `global_step` correctly stays unchanged)
+
+    def _on_before_optimizer_step(self) -> None:
+        self.trainer.profiler.start("optimizer_step")
+
+    def _on_after_optimizer_step(self) -> None:
+        self.trainer.profiler.stop("optimizer_step")
+        self._optimizer_step_ran = True
+
+    @staticmethod
+    def _gradients_are_non_finite(optimizer: Optimizer) -> bool:
+        """Whether any of the gradients seen by the optimizer contain non-finite values (NaN or Inf)."""
+        for param_group in optimizer.param_groups:
+            for param in param_group["params"]:
+                grad = getattr(param, "grad", None)
+                if grad is not None and not torch.isfinite(grad).all():
+                    return True
+        return False
 
     def _on_before_zero_grad(self, optimizer: torch.optim.Optimizer) -> None:
         """Calls the ``on_before_zero_grad`` hook.

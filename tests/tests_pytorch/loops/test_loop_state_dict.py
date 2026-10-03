@@ -57,6 +57,16 @@ def test_loops_state_dict_structure():
                         "total": {"ready": 0, "started": 0, "completed": 0},
                         "current": {"ready": 0, "started": 0, "completed": 0},
                     },
+                    "skipped": {
+                        "invalid_gradient": {
+                            "total": {"ready": 0, "completed": 0},
+                            "current": {"ready": 0, "completed": 0},
+                        },
+                        "accumulation": {
+                            "total": {"ready": 0, "completed": 0},
+                            "current": {"ready": 0, "completed": 0},
+                        },
+                    },
                 },
             },
             "epoch_loop.val_loop.state_dict": {},

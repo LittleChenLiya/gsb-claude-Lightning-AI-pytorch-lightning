@@ -250,35 +250,87 @@ class _SchedulerProgress(_Progress):
 
 
 @dataclass
+class _SkippedProgress(_BaseProgress):
+    """Tracks skipped optimizer steps by skip reason.
+
+    These counters are local to a trainer rank. By default, they are not globally synced across all ranks.
+
+    Args:
+        invalid_gradient: Tracks step-boundary batches that did not perform an ``optimizer.step`` because the
+            gradients were invalid (e.g. they contained ``NaN`` or ``Inf`` values).
+        accumulation: Tracks batches that did not reach the gradient accumulation window and therefore only
+            accumulated gradients without calling ``optimizer.step``.
+
+    Like the regular step progress, each entry keeps a ``total`` tracker (not reset between epochs) and a
+    ``current`` tracker (reset at the start of every epoch).
+
+    """
+
+    invalid_gradient: _Progress = field(default_factory=lambda: _Progress.from_defaults(_ReadyCompletedTracker))
+    accumulation: _Progress = field(default_factory=lambda: _Progress.from_defaults(_ReadyCompletedTracker))
+
+    @property
+    def total_skipped(self) -> int:
+        return self.invalid_gradient.total.completed + self.accumulation.total.completed
+
+    @override
+    def reset(self) -> None:
+        self.invalid_gradient.reset()
+        self.accumulation.reset()
+
+    def reset_on_run(self) -> None:
+        self.invalid_gradient.reset_on_run()
+        self.accumulation.reset_on_run()
+
+    def reset_on_restart(self) -> None:
+        self.invalid_gradient.reset_on_restart()
+        self.accumulation.reset_on_restart()
+
+    @override
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.invalid_gradient.load_state_dict(state_dict["invalid_gradient"])
+        self.accumulation.load_state_dict(state_dict["accumulation"])
+
+
+@dataclass
 class _OptimizerProgress(_BaseProgress):
     """Track optimizer progress.
 
     Args:
         step: Tracks ``optimizer.step`` calls.
         zero_grad: Tracks ``optimizer.zero_grad`` calls.
+        skipped: Tracks batches for which the optimizer step was skipped, split by reason (invalid gradient or
+            pending gradient accumulation).
 
     """
 
     step: _Progress = field(default_factory=lambda: _Progress.from_defaults(_ReadyCompletedTracker))
     zero_grad: _Progress = field(default_factory=lambda: _Progress.from_defaults(_StartedTracker))
+    skipped: _SkippedProgress = field(default_factory=_SkippedProgress)
 
     @override
     def reset(self) -> None:
         self.step.reset()
         self.zero_grad.reset()
+        self.skipped.reset()
 
     def reset_on_run(self) -> None:
         self.step.reset_on_run()
         self.zero_grad.reset_on_run()
+        self.skipped.reset_on_run()
 
     def reset_on_restart(self) -> None:
         self.step.reset_on_restart()
         self.zero_grad.reset_on_restart()
+        self.skipped.reset_on_restart()
 
     @override
     def load_state_dict(self, state_dict: dict) -> None:
         self.step.load_state_dict(state_dict["step"])
         self.zero_grad.load_state_dict(state_dict["zero_grad"])
+        # backward compatibility with checkpoints saved before skipped-step tracking was introduced
+        if "skipped" in state_dict:
+            self.skipped.load_state_dict(state_dict["skipped"])
 
 
 @dataclass
@@ -295,6 +347,21 @@ class _OptimizationProgress(_BaseProgress):
     @property
     def optimizer_steps(self) -> int:
         return self.optimizer.step.total.completed
+
+    @property
+    def skipped_optimizer_steps(self) -> int:
+        """Total number of batches that did not perform an ``optimizer.step``."""
+        return self.optimizer.skipped.total_skipped
+
+    @property
+    def skipped_optimizer_steps_invalid_gradient(self) -> int:
+        """Number of times the step was skipped because the gradients contained non-finite values (NaN or Inf)."""
+        return self.optimizer.skipped.invalid_gradient.total.completed
+
+    @property
+    def skipped_optimizer_steps_accumulation(self) -> int:
+        """Number of batches that only accumulated gradients because the accumulation window was not yet reached."""
+        return self.optimizer.skipped.accumulation.total.completed
 
     @override
     def reset(self) -> None:
