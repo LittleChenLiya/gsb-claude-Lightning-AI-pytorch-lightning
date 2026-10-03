@@ -159,6 +159,10 @@ class _AutomaticOptimization(_Loop):
         super().__init__(trainer)
         self.optim_progress: _OptimizationProgress = _OptimizationProgress()
         self._skip_backward: bool = False
+        # Set to ``True`` by the backward closure when the computed gradients contain non-finite values (NaN/Inf).
+        # It is reset at the beginning of each ``run`` and inspected in ``_optimizer_step`` to decide whether the
+        # optimizer step should be skipped.
+        self._invalid_gradients: bool = False
 
     def run(self, optimizer: Optimizer, batch_idx: int, kwargs: OrderedDict) -> _OUTPUTS_TYPE:
         """Runs closure (train step + backward) together with optimization if necessary.
@@ -169,6 +173,8 @@ class _AutomaticOptimization(_Loop):
             optimizer: the optimizer
 
         """
+        # reset the flag for this run
+        self._invalid_gradients = False
         closure = self._make_closure(kwargs, optimizer, batch_idx)
 
         if (
@@ -183,6 +189,10 @@ class _AutomaticOptimization(_Loop):
             # automatic_optimization=True: perform ddp sync only when performing optimizer_step
             with _block_parallel_sync_behavior(self.trainer.strategy, block=True):
                 closure()
+
+            # the closure ran (forward + backward) but ``optimizer.step`` was not called because the accumulation
+            # window had not been reached
+            self.optim_progress.optimizer.skip.accumulation.increment_by(1)
 
         # ------------------------------
         # BACKWARD PASS
@@ -240,6 +250,15 @@ class _AutomaticOptimization(_Loop):
         def backward_fn(loss: Tensor) -> None:
             call._call_strategy_hook(self.trainer, "backward", loss, optimizer)
 
+            # check the gradients right after backward, before the optimizer applies them. if the gradients are
+            # non-finite (NaN/Inf), the optimizer step would corrupt the weights, so we mark the step as invalid and
+            # zero the gradients to prevent the weight update. when the precision plugin uses a scaler (AMP), the
+            # scaler already skips the step on non-finite gradients, so we only mark the flag and leave the gradients
+            # untouched.
+            self._invalid_gradients = self._has_invalid_gradients(optimizer)
+            if self._invalid_gradients and not self._trainer_uses_scaler():
+                self._zero_gradients(optimizer)
+
         return backward_fn
 
     def _optimizer_step(
@@ -276,8 +295,32 @@ class _AutomaticOptimization(_Loop):
             train_step_and_backward_closure,
         )
 
-        if not should_accumulate:
+        if self._invalid_gradients:
+            # the optimizer step was skipped because the gradients were non-finite (NaN/Inf). the weights were not
+            # updated, so we must not count a completed step.
+            self.optim_progress.optimizer.skip.invalid_gradients.increment_by(1)
+        elif not should_accumulate:
             self.optim_progress.optimizer.step.increment_completed()
+
+    def _has_invalid_gradients(self, optimizer: Optimizer) -> bool:
+        """Check whether any of the optimizer's gradients contain non-finite values (NaN/Inf)."""
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param.grad is not None and not torch.isfinite(param.grad).all():
+                    return True
+        return False
+
+    def _zero_gradients(self, optimizer: Optimizer) -> None:
+        """Zero out the gradients to prevent the optimizer from applying non-finite values to the weights."""
+        for group in optimizer.param_groups:
+            for param in group["params"]:
+                if param.grad is not None:
+                    param.grad = None
+
+    def _trainer_uses_scaler(self) -> bool:
+        """Whether the precision plugin uses a gradient scaler (AMP), which handles skipping the step on non-finite
+        gradients internally."""
+        return self.trainer.scaler is not None
 
     def _on_before_zero_grad(self, optimizer: torch.optim.Optimizer) -> None:
         """Calls the ``on_before_zero_grad`` hook.

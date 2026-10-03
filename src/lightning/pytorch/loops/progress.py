@@ -250,35 +250,76 @@ class _SchedulerProgress(_Progress):
 
 
 @dataclass
+class _OptimizerSkipProgress(_BaseProgress):
+    """Track optimizer steps that were skipped (no weight update occurred).
+
+    Distinguishes the reason the step was skipped:
+
+    - ``invalid_gradients``: the computed gradients contained non-finite values (NaN/Inf), so the optimizer step was
+      skipped to avoid corrupting the weights.
+    - ``accumulation``: the gradient accumulation window had not been reached, so the closure ran (forward + backward)
+      but ``optimizer.step`` was not called.
+
+    """
+
+    invalid_gradients: _Progress = field(default_factory=lambda: _Progress.from_defaults(_ReadyCompletedTracker))
+    accumulation: _Progress = field(default_factory=lambda: _Progress.from_defaults(_ReadyCompletedTracker))
+
+    @override
+    def reset(self) -> None:
+        self.invalid_gradients.reset()
+        self.accumulation.reset()
+
+    def reset_on_run(self) -> None:
+        self.invalid_gradients.reset_on_run()
+        self.accumulation.reset_on_run()
+
+    def reset_on_restart(self) -> None:
+        self.invalid_gradients.reset_on_restart()
+        self.accumulation.reset_on_restart()
+
+    @override
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.invalid_gradients.load_state_dict(state_dict["invalid_gradients"])
+        self.accumulation.load_state_dict(state_dict["accumulation"])
+
+
+@dataclass
 class _OptimizerProgress(_BaseProgress):
     """Track optimizer progress.
 
     Args:
         step: Tracks ``optimizer.step`` calls.
         zero_grad: Tracks ``optimizer.zero_grad`` calls.
+        skip: Tracks optimizer steps that were skipped without updating the weights.
 
     """
 
     step: _Progress = field(default_factory=lambda: _Progress.from_defaults(_ReadyCompletedTracker))
     zero_grad: _Progress = field(default_factory=lambda: _Progress.from_defaults(_StartedTracker))
+    skip: _OptimizerSkipProgress = field(default_factory=_OptimizerSkipProgress)
 
     @override
     def reset(self) -> None:
         self.step.reset()
         self.zero_grad.reset()
+        self.skip.reset()
 
     def reset_on_run(self) -> None:
         self.step.reset_on_run()
         self.zero_grad.reset_on_run()
+        self.skip.reset_on_run()
 
     def reset_on_restart(self) -> None:
         self.step.reset_on_restart()
         self.zero_grad.reset_on_restart()
+        self.skip.reset_on_restart()
 
     @override
     def load_state_dict(self, state_dict: dict) -> None:
         self.step.load_state_dict(state_dict["step"])
         self.zero_grad.load_state_dict(state_dict["zero_grad"])
+        self.skip.load_state_dict(state_dict["skip"])
 
 
 @dataclass
