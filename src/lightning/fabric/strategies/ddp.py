@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
 from contextlib import AbstractContextManager, nullcontext
 from datetime import timedelta
 from typing import Any, Literal, Optional, Union
@@ -41,7 +42,16 @@ from lightning.fabric.utilities.distributed import (
     _sync_ddp_if_available,
 )
 from lightning.fabric.utilities.distributed import group as _group
-from lightning.fabric.utilities.rank_zero import rank_zero_only
+from lightning.fabric.utilities.rank_zero import rank_zero_info, rank_zero_only
+
+_log = logging.getLogger(__name__)
+
+# Convergence status reported by each rank when the DDP group tears down.
+# A rank that finished its work normally is ``converged``; a rank that exited
+# early due to an exception is ``failed``; ranks that never reach teardown
+# (crash / hang / timeout) are reported as missing by their peers.
+_STATUS_CONVERGED = "converged"
+_STATUS_FAILED = "failed"
 
 _DDP_FORK_ALIASES = (
     "ddp_fork",
@@ -77,12 +87,31 @@ class DDPStrategy(ParallelStrategy):
         self._start_method = start_method
         self._backward_sync_control = _DDPBackwardSyncControl()
         self._ddp_kwargs = kwargs
+        # Convergence / teardown bookkeeping for the group exit report.
+        self._converged: bool = True
+        self._teardown_done: bool = False
+        self._exit_report: Optional[dict[str, Any]] = None
 
     @property
     @override
     def root_device(self) -> torch.device:
         assert self.parallel_devices is not None
         return self.parallel_devices[self.local_rank]
+
+    @property
+    def converged(self) -> bool:
+        """Whether this rank has converged (finished its work without error)."""
+        return self._converged
+
+    def mark_failed(self) -> None:
+        """Mark this rank as having exited abnormally (did not converge).
+
+        Call this when the process exits early due to an exception so that the
+        group exit report produced by :meth:`teardown` can reflect the
+        non-converged status of this rank.
+
+        """
+        self._converged = False
 
     @property
     def num_nodes(self) -> int:
@@ -191,6 +220,93 @@ class DDPStrategy(ParallelStrategy):
         obj = [obj]
         torch.distributed.broadcast_object_list(obj, src, group=_group.WORLD)
         return obj[0]
+
+    @override
+    def teardown(self) -> None:
+        """Tear down the distributed strategy and emit a group exit report.
+
+        The report gathers the convergence status of every rank. The exchange
+        is best-effort: if a rank is missing or times out, the remaining ranks
+        log what they know and proceed with cleanup instead of blocking
+        forever. Idempotent -- calling this more than once is a no-op.
+
+        """
+        if self._teardown_done:
+            return
+        self._teardown_done = True
+        try:
+            self._report_group_exit()
+        except Exception:
+            # The report must never block or abort cleanup. The report method
+            # handles expected failures itself; this guards against the rest.
+            _log.exception("Failed to produce the DDP group exit report. Proceeding with cleanup.")
+        finally:
+            super().teardown()
+
+    def _report_group_exit(self) -> None:
+        """Gather convergence statuses from all ranks and log the exit report."""
+        own_status = _STATUS_CONVERGED if self._converged else _STATUS_FAILED
+
+        if not _distributed_is_initialized():
+            self._exit_report = self._build_exit_report(all_statuses=None, gather_succeeded=False)
+            _log.info(
+                "DDP group exit report: rank %d/%d status=%s (distributed group not initialized)",
+                self.global_rank, self.world_size, own_status,
+            )
+            return
+
+        world_size = self.world_size
+        gathered: list[Optional[str]] = [None] * world_size
+        gather_succeeded = True
+        try:
+            torch.distributed.all_gather_object(gathered, own_status, group=_group.WORLD)
+        except Exception as exc:
+            # A rank may have exited early or timed out. Do not block forever:
+            # record what we know and let cleanup proceed.
+            gather_succeeded = False
+            _log.warning(
+                "DDP group exit report: could not gather convergence statuses from all ranks"
+                " (%s). Known status for rank %d/%d: %s. Proceeding with cleanup.",
+                exc, self.global_rank, world_size, own_status,
+            )
+
+        self._exit_report = self._build_exit_report(
+            all_statuses=gathered if gather_succeeded else None,
+            gather_succeeded=gather_succeeded,
+        )
+
+        if gather_succeeded and self.global_rank == 0:
+            self._log_exit_report(gathered)
+        elif not gather_succeeded:
+            _log.info(
+                "DDP group exit report: rank %d/%d status=%s (aggregate report unavailable)",
+                self.global_rank, world_size, own_status,
+            )
+
+    def _build_exit_report(
+        self, all_statuses: Optional[list[Optional[str]]], gather_succeeded: bool
+    ) -> dict[str, Any]:
+        return {
+            "world_size": self.world_size,
+            "rank": self.global_rank,
+            "status": _STATUS_CONVERGED if self._converged else _STATUS_FAILED,
+            "all_statuses": all_statuses,
+            "gather_succeeded": gather_succeeded,
+        }
+
+    @staticmethod
+    def _log_exit_report(all_statuses: list[Optional[str]]) -> None:
+        world_size = len(all_statuses)
+        n_converged = sum(1 for status in all_statuses if status == _STATUS_CONVERGED)
+        status_str = ", ".join(f"rank {i}={status}" for i, status in enumerate(all_statuses))
+        if n_converged == world_size:
+            rank_zero_info(
+                f"DDP group exit report: all {world_size} ranks converged. [{status_str}]"
+            )
+        else:
+            rank_zero_info(
+                f"DDP group exit report: {n_converged}/{world_size} ranks converged. [{status_str}]"
+            )
 
     @override
     def get_module_state_dict(self, module: Module) -> dict[str, Union[Any, Tensor]]:
